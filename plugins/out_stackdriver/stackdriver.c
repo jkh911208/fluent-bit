@@ -31,6 +31,9 @@
 #include "stackdriver.h"
 #include "stackdriver_conf.h"
 #include "stackdriver_operation.h"
+#include "stackdriver_source_location.h"
+#include "stackdriver_http_request.h"
+#include "stackdriver_timestamp.h"
 #include "stackdriver_helper.h"
 #include <mbedtls/base64.h>
 #include <mbedtls/sha256.h>
@@ -791,10 +794,15 @@ static insert_id_status validate_insert_id(msgpack_object * insert_id_value,
     }
     return ret;
 }
-
+                                                                                        
 static int pack_json_payload(int insert_id_extracted, 
-                             int operation_extracted, int operation_extra_size, 
-                             msgpack_packer* mp_pck, msgpack_object *obj,
+                             int operation_extracted, int operation_extra_size,
+                             int source_location_extracted, 
+                             int source_location_extra_size,
+                             int http_request_extracted, 
+                             int http_request_extra_size,
+                             timestamp_status tms_status,
+                             msgpack_packer *mp_pck, msgpack_object *obj,
                              struct flb_stackdriver *ctx)
 {
     /* Specified fields include local_resource_id, operation, sourceLocation ... */
@@ -823,11 +831,23 @@ static int pack_json_payload(int insert_id_extracted,
         /* more special fields are required to be added */
     };
 
-    if(insert_id_extracted == FLB_TRUE) {
+    if (insert_id_extracted == FLB_TRUE) {
         to_remove += 1;
     }
     if (operation_extracted == FLB_TRUE && operation_extra_size == 0) {
         to_remove += 1;
+    }
+    if (source_location_extracted == FLB_TRUE && source_location_extra_size == 0) {
+        to_remove += 1;
+    }
+    if (http_request_extracted == FLB_TRUE && http_request_extra_size == 0) {
+        to_remove += 1;
+    }
+    if (tms_status == FORMAT_TIMESTAMP_OBJECT) {
+        to_remove += 1;
+    }
+    if (tms_status == FORMAT_TIMESTAMP_DUO_FIELDS) {
+        to_remove += 2;
     }
 
     map_size = obj->via.map.size;
@@ -871,11 +891,48 @@ static int pack_json_payload(int insert_id_extracted,
         if (validate_key(kv->key, OPERATION_FIELD_IN_JSON, 
                          OPERATION_KEY_SIZE)
             && kv->val.type == MSGPACK_OBJECT_MAP) {
-
             if (operation_extra_size > 0) {
                 msgpack_pack_object(mp_pck, kv->key);
                 pack_extra_operation_subfields(mp_pck, &kv->val, operation_extra_size);
             }
+            continue;
+        }
+
+        if (validate_key(kv->key, SOURCELOCATION_FIELD_IN_JSON, 
+                         SOURCE_LOCATION_SIZE)
+            && kv->val.type == MSGPACK_OBJECT_MAP) {
+
+            if (source_location_extra_size > 0) {
+                msgpack_pack_object(mp_pck, kv->key);
+                pack_extra_source_location_subfields(mp_pck, &kv->val, 
+                                                     source_location_extra_size);
+            }
+            continue;
+        }
+        
+        if (validate_key(kv->key, HTTPREQUEST_FIELD_IN_JSON, 
+                         HTTP_REQUEST_KEY_SIZE) 
+            && kv->val.type == MSGPACK_OBJECT_MAP) {
+
+            if(http_request_extra_size > 0) {
+                msgpack_pack_object(mp_pck, kv->key);
+                pack_extra_http_request_subfields(mp_pck, &kv->val, 
+                                                  http_request_extra_size);
+            }
+            continue;
+        }
+        
+        if (validate_key(kv->key, "timestamp", 9)
+            && tms_status == FORMAT_TIMESTAMP_OBJECT) {
+            continue;
+        }
+
+        if (validate_key(kv->key, "timestampSeconds", 16)
+            && tms_status == FORMAT_TIMESTAMP_DUO_FIELDS) {
+            continue;
+        }
+        if (validate_key(kv->key, "timestampNanos", 14)
+            && tms_status == FORMAT_TIMESTAMP_DUO_FIELDS) {
             continue;
         }
 
@@ -925,8 +982,6 @@ static int stackdriver_format(struct flb_config *config,
     char path[PATH_MAX];
     char time_formatted[255];
     const char *newtag;
-    struct tm tm;
-    struct flb_time tms;
     msgpack_object *obj;
     msgpack_object *labels_ptr;
     msgpack_unpacked result;
@@ -951,6 +1006,23 @@ static int stackdriver_format(struct flb_config *config,
     int operation_last = FLB_FALSE;
     int operation_extracted = FLB_FALSE;
     int operation_extra_size = 0;
+
+    /* Parameters for sourceLocation */
+    flb_sds_t source_location_file;
+    int64_t source_location_line = 0;
+    flb_sds_t source_location_function;
+    int source_location_extracted = FLB_FALSE;
+    int source_location_extra_size = 0;
+    
+    /* Parameters for httpRequest */
+    struct http_request_field http_request;
+    int http_request_extracted = FLB_FALSE;
+    int http_request_extra_size = 0;
+    
+    /* Parameters for Timestamp */
+    struct tm tm;
+    struct flb_time tms;
+    timestamp_status tms_status;
 
     /* Count number of records */
     array_size = flb_mp_count(data, bytes);
@@ -1194,6 +1266,7 @@ static int stackdriver_format(struct flb_config *config,
     while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
         /* Get timestamp */
         flb_time_pop_from_msgpack(&tms, &result, &obj);
+        tms_status = extract_timestamp(obj, &tms);
 
         /*
          * Pack entry
@@ -1243,6 +1316,30 @@ static int stackdriver_format(struct flb_config *config,
             entry_size += 1;
         }
 
+        /* Extract sourceLocation */
+        source_location_file = flb_sds_create("");
+        source_location_line = 0;
+        source_location_function = flb_sds_create("");
+        source_location_extra_size = 0;
+        source_location_extracted = extract_source_location(&source_location_file, 
+                                                            &source_location_line,
+                                                            &source_location_function, 
+                                                            obj, 
+                                                            &source_location_extra_size);
+
+        if (source_location_extracted == FLB_TRUE) {
+            entry_size += 1;
+        }
+        
+        /* Extract httpRequest */
+        init_http_request(&http_request);
+        http_request_extra_size = 0;
+        http_request_extracted = extract_http_request(&http_request, obj, 
+                                                      &http_request_extra_size);
+        if (http_request_extracted == FLB_TRUE) {
+            entry_size += 1;
+        }
+
         /* Extract labels */
         labels_ptr = parse_labels(ctx, obj);
         if (labels_ptr != NULL) {
@@ -1279,6 +1376,17 @@ static int stackdriver_format(struct flb_config *config,
                                 &operation_first, &operation_last, &mp_pck);
         }
 
+        /* Add sourceLocation field into the log entry */
+        if (source_location_extracted == FLB_TRUE) {
+            add_source_location_field(&source_location_file, source_location_line, 
+                                      &source_location_function, &mp_pck);
+        }
+        
+        /* Add httpRequest field into the log entry */
+        if (http_request_extracted == FLB_TRUE) {
+            add_http_request_field(&http_request, &mp_pck);
+        }
+
         /* labels */
         if (labels_ptr != NULL) {
             msgpack_pack_str(&mp_pck, 6);
@@ -1289,12 +1397,20 @@ static int stackdriver_format(struct flb_config *config,
         /* Clean up */
         flb_sds_destroy(operation_id);
         flb_sds_destroy(operation_producer);
+        flb_sds_destroy(source_location_file);
+        flb_sds_destroy(source_location_function);
+        destroy_http_request(&http_request);
 
         /* jsonPayload */
         msgpack_pack_str(&mp_pck, 11);
         msgpack_pack_str_body(&mp_pck, "jsonPayload", 11);
-        pack_json_payload(insert_id_extracted, 
-                          operation_extracted, operation_extra_size, 
+        pack_json_payload(insert_id_extracted,
+                          operation_extracted, operation_extra_size,
+                          source_location_extracted,
+                          source_location_extra_size, 
+                          http_request_extracted, 
+                          http_request_extra_size,
+                          tms_status,
                           &mp_pck, obj, ctx);
 
         /* avoid modifying the original tag */
@@ -1322,15 +1438,24 @@ static int stackdriver_format(struct flb_config *config,
         msgpack_pack_str_body(&mp_pck, "timestamp", 9);
 
         /* Format the time */
+        /* 
+         * If format is timestamp_object or timestamp_duo_fields, 
+         * tms has been updated. 
+         * 
+         * If timestamp is not presen,
+         * use the default tms(current time).
+         */
+        
         gmtime_r(&tms.tm.tv_sec, &tm);
         s = strftime(time_formatted, sizeof(time_formatted) - 1,
-                     FLB_STD_TIME_FMT, &tm);
+                        FLB_STD_TIME_FMT, &tm);
         len = snprintf(time_formatted + s, sizeof(time_formatted) - 1 - s,
-                       ".%09" PRIu64 "Z", (uint64_t) tms.tm.tv_nsec);
+                        ".%09" PRIu64 "Z", (uint64_t) tms.tm.tv_nsec);
         s += len;
 
         msgpack_pack_str(&mp_pck, s);
         msgpack_pack_str_body(&mp_pck, time_formatted, s);
+
     }
 
     /* Convert from msgpack to JSON */
