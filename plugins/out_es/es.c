@@ -440,7 +440,7 @@ static int elasticsearch_format(struct flb_config *config,
             p += s;
             *p++ = '\0';
             es_index = logstash_index;
-            remove_token(es_index)
+            remove_token(es_index);
             if (ctx->generate_id == FLB_FALSE) {
                 index_len = snprintf(j_index,
                                      ES_BULK_HEADER,
