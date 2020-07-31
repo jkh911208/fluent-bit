@@ -42,6 +42,36 @@ static int es_pack_array_content(msgpack_packer *tmp_pck,
                                  struct flb_elasticsearch *ctx);
 
 #ifdef FLB_HAVE_AWS
+
+void remove_token(char *input) {
+    char *target;
+    char *source;
+    char *end = &input[strlen(input)];
+
+    for(source=input,target=input;source<end;++source) {
+        switch(*source) {
+            case '<':
+            case '>':
+            case '#':
+            case '?':
+            case '|':
+            case '/':
+            case '\\':
+            case '+':
+            case '*':
+            case '\"':
+            case '.':
+            case ' ':
+                break;
+            default:
+                *target=*source;
+                ++target;
+                break;
+        }
+    }
+    *target=0;
+}
+
 static flb_sds_t add_aws_auth(struct flb_http_client *c,
                               struct flb_elasticsearch *ctx)
 {
@@ -410,6 +440,7 @@ static int elasticsearch_format(struct flb_config *config,
             p += s;
             *p++ = '\0';
             es_index = logstash_index;
+            remove_token(es_index)
             if (ctx->generate_id == FLB_FALSE) {
                 index_len = snprintf(j_index,
                                      ES_BULK_HEADER,
